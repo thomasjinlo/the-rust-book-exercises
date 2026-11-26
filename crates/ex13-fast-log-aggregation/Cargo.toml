@@ -1,0 +1,13 @@
+[package]
+name = "ex13-fast-log-aggregation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Used only by the SIMD stretch goal.
+memchr = "2.7"
+
+[profile.release]
+debug = 1
+
+[workspace]

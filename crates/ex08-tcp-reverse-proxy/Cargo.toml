@@ -1,0 +1,13 @@
+[package]
+name = "ex08-tcp-reverse-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
+# The 64 MiB transfer test hashes every byte; unoptimized code makes it slow.
+[profile.dev]
+opt-level = 2
+
+[workspace]

@@ -1,0 +1,170 @@
+//! Length-prefixed frame codec for a byte stream.
+//!
+//! Wire format of one frame:
+//!
+//! ```text
+//! +----------------+--------+----------------------+
+//! | L: u32, big-   | kind   | payload              |
+//! | endian         | 1 byte | L - 1 bytes          |
+//! +----------------+--------+----------------------+
+//! ```
+//!
+//! `L` counts the kind byte plus the payload, so `L >= 1`. The 4 length
+//! bytes are not counted in `L`. A frame occupies `4 + L` bytes on the wire.
+
+use std::fmt;
+
+/// One decoded message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub kind: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Returned by [`encode`] and [`encode_with_limit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    /// `1 + payload.len()` exceeds the limit (`u32::MAX` for [`encode`]).
+    PayloadTooLarge,
+}
+
+/// Returned by [`Decoder::next_frame`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The length field was 0. A frame needs at least the kind byte.
+    ZeroLength,
+    /// The length field `len` is greater than the decoder's `max`.
+    FrameTooLarge { len: u32, max: u32 },
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::PayloadTooLarge => write!(f, "payload too large"),
+        }
+    }
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecodeError::ZeroLength => write!(f, "frame length is zero"),
+            DecodeError::FrameTooLarge { len, max } => {
+                write!(f, "frame length {len} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+impl std::error::Error for DecodeError {}
+
+/// Appends the wire encoding of `frame` to `out`, with limit `u32::MAX`.
+///
+/// On error `out` is left unchanged.
+pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    encode_with_limit(frame, u32::MAX, out)
+}
+
+/// Appends the wire encoding of `frame` to `out`.
+///
+/// Fails with [`EncodeError::PayloadTooLarge`] when `1 + payload.len()`
+/// is greater than `max_len` or greater than `u32::MAX`. A frame with
+/// `1 + payload.len() == max_len` is accepted. On error `out` is left unchanged.
+pub fn encode_with_limit(
+    frame: &Frame,
+    max_len: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    // usize -> u64 is lossless; `try_from` rejects lengths above u32::MAX.
+    let len = u32::try_from(1 + frame.payload.len() as u64)
+        .ok()
+        .filter(|&l| l <= max_len)
+        .ok_or(EncodeError::PayloadTooLarge)?;
+    out.reserve(4 + len as usize);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.push(frame.kind);
+    out.extend_from_slice(&frame.payload);
+    Ok(())
+}
+
+/// Incremental decoder. Feed it arbitrary chunks, then pull frames.
+#[derive(Debug)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    /// Start of the first undecoded byte in `buf`.
+    pos: usize,
+    max: u32,
+    poisoned: Option<DecodeError>,
+}
+
+impl Decoder {
+    /// Creates a decoder that rejects any length field greater than `max_frame_len`.
+    pub fn new(max_frame_len: u32) -> Decoder {
+        Decoder {
+            buf: Vec::new(),
+            pos: 0,
+            max: max_frame_len,
+            poisoned: None,
+        }
+    }
+
+    /// Appends `bytes` to the internal buffer. Never decodes and never fails.
+    /// Ignores the input once the decoder is poisoned.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.poisoned.is_none() {
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// Returns the next complete frame, `Ok(None)` if more bytes are needed,
+    /// or an error. After an error the decoder is poisoned: every later call
+    /// returns a clone of the same error.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
+        if let Some(e) = &self.poisoned {
+            return Err(e.clone());
+        }
+        let avail = &self.buf[self.pos..];
+        let Some(header) = avail.first_chunk::<4>() else {
+            self.compact();
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(*header);
+        // Checked on the header alone, before any payload byte arrives.
+        let err = if len == 0 {
+            Some(DecodeError::ZeroLength)
+        } else if len > self.max {
+            Some(DecodeError::FrameTooLarge { len, max: self.max })
+        } else {
+            None
+        };
+        if let Some(e) = err {
+            self.poisoned = Some(e.clone());
+            return Err(e);
+        }
+        let total = 4 + len as usize;
+        if avail.len() < total {
+            self.compact();
+            return Ok(None);
+        }
+        let frame = Frame {
+            kind: avail[4],
+            payload: avail[5..total].to_vec(),
+        };
+        self.pos += total;
+        Ok(Some(frame))
+    }
+
+    /// Number of bytes currently held in the internal buffer, including any
+    /// already-decoded bytes that have not been compacted away yet.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Drops decoded bytes. Called only when waiting for input, so the cost
+    /// is one memmove of the partial frame per `feed`, not per frame.
+    fn compact(&mut self) {
+        self.buf.drain(..self.pos);
+        self.pos = 0;
+    }
+}
