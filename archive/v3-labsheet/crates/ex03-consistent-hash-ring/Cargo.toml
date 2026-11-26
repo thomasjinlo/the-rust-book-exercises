@@ -1,0 +1,8 @@
+[package]
+name = "ex03-consistent-hash-ring"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[workspace]

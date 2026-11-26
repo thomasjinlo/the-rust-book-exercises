@@ -1,331 +1,203 @@
-use ex05_write_ahead_log::{FILE_HEADER, RECORD_HEADER_LEN, Recovery, Wal, WalOptions};
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
-use std::path::Path;
+use ex05_write_ahead_log::Wal;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-const MAX: u32 = 1 << 20;
+static NEXT: AtomicU32 = AtomicU32::new(0);
 
-fn opts() -> WalOptions {
-    WalOptions {
-        sync_each_append: false,
-        max_record_len: MAX,
+/// A fresh path in the system temp dir, removed when dropped.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new() -> Self {
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        TempFile(std::env::temp_dir().join(format!("wal-test-{}-{n}.log", std::process::id())))
     }
 }
 
-fn payload(i: usize) -> Vec<u8> {
-    format!("record-{i}-{}", "x".repeat(i % 37)).into_bytes()
-}
-
-/// Byte offset just past each record, given the payloads.
-fn record_ends(payloads: &[Vec<u8>]) -> Vec<u64> {
-    let mut pos = FILE_HEADER.len() as u64;
-    payloads
-        .iter()
-        .map(|p| {
-            pos += RECORD_HEADER_LEN + p.len() as u64;
-            pos
-        })
-        .collect()
-}
-
-fn write_log(path: &Path, payloads: &[Vec<u8>]) {
-    let (mut wal, rec) = Wal::open(path, opts()).unwrap();
-    assert_eq!(rec.records_recovered, 0);
-    for p in payloads {
-        wal.append(p).unwrap();
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
-fn flip_bit(path: &Path, offset: u64, bit: u8) {
-    let mut bytes = fs::read(path).unwrap();
-    bytes[offset as usize] ^= 1 << bit;
-    fs::write(path, bytes).unwrap();
+fn write_log(path: &Path, records: &[&[u8]]) {
+    let (mut wal, _) = Wal::open(path).unwrap();
+    for r in records {
+        wal.append(r).unwrap();
+    }
 }
 
-fn file_len(path: &Path) -> u64 {
-    fs::metadata(path).unwrap().len()
+fn reopen(path: &Path) -> Vec<Vec<u8>> {
+    Wal::open(path).unwrap().1
 }
 
-fn truncate(path: &Path, len: u64) {
-    OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_len(len)
-        .unwrap();
+fn as_slices(v: &[Vec<u8>]) -> Vec<&[u8]> {
+    v.iter().map(|r| r.as_slice()).collect()
 }
 
-// ---- Milestone 1: header + open ----
+const THREE: [&[u8]; 3] = [b"alpha", b"", b"gamma"];
 
 #[test]
-fn header_handling() {
-    let dir = tempfile::tempdir().unwrap();
+fn a_missing_file_is_created_and_has_no_records() {
+    let t = TempFile::new();
+    let (_wal, records) = Wal::open(&t.0).unwrap();
+    assert!(records.is_empty());
+    assert!(t.0.exists());
+}
 
-    // Wrong header, 8 or more bytes: InvalidData, file untouched.
-    let bad = dir.path().join("bad");
-    fs::write(&bad, b"WALv0002 and some more bytes").unwrap();
-    let err = Wal::open(&bad, opts()).err().unwrap();
-    assert_eq!(err.kind(), ErrorKind::InvalidData);
-    assert_eq!(fs::read(&bad).unwrap(), b"WALv0002 and some more bytes");
-    let err = Wal::read_all(&bad, MAX).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidData);
+#[test]
+fn appended_records_come_back_in_order() {
+    let t = TempFile::new();
+    write_log(&t.0, &THREE);
+    assert_eq!(as_slices(&reopen(&t.0)), THREE);
+}
 
-    // Exactly 8 wrong bytes is still a wrong header.
-    let eight = dir.path().join("eight");
-    fs::write(&eight, b"XXXXXXXX").unwrap();
+#[test]
+fn an_appended_record_is_in_the_file_before_the_log_is_dropped() {
+    let t = TempFile::new();
+    let (mut wal, _) = Wal::open(&t.0).unwrap();
+    wal.append(b"alpha").unwrap();
+    assert!(fs::metadata(&t.0).unwrap().len() >= 5);
+    assert_eq!(as_slices(&reopen(&t.0)), [b"alpha".as_slice()]);
+    wal.append(b"beta").unwrap();
+    assert_eq!(reopen(&t.0).len(), 2);
+}
+
+#[test]
+fn records_can_hold_any_bytes() {
+    let t = TempFile::new();
+    let all: Vec<u8> = (0..=255).collect();
+    write_log(&t.0, &[&all, &[0, 0, 0, 0], &[0xff; 3000]]);
     assert_eq!(
-        Wal::open(&eight, opts()).err().unwrap().kind(),
-        ErrorKind::InvalidData
+        as_slices(&reopen(&t.0)),
+        [all.as_slice(), &[0, 0, 0, 0], &[0xff; 3000]]
     );
+}
 
-    // Missing, empty and short files get a fresh header.
-    for (name, initial) in [
-        ("missing", None),
-        ("empty", Some(&b""[..])),
-        ("short", Some(&b"WAL"[..])),
-        ("short7", Some(&b"garbage"[..])),
-    ] {
-        let path = dir.path().join(name);
-        if let Some(bytes) = initial {
-            fs::write(&path, bytes).unwrap();
-        }
-        let (mut wal, rec) = Wal::open(&path, opts()).unwrap();
-        assert_eq!(
-            rec,
-            Recovery {
-                records_recovered: 0,
-                bytes_truncated: 0
-            },
-            "{name}"
+#[test]
+fn reopening_and_appending_adds_to_the_end() {
+    let t = TempFile::new();
+    write_log(&t.0, &THREE);
+    write_log(&t.0, &[b"delta"]);
+    assert_eq!(
+        as_slices(&reopen(&t.0)),
+        [b"alpha".as_slice(), b"", b"gamma", b"delta"]
+    );
+}
+
+#[test]
+fn a_file_cut_inside_a_record_loses_that_record() {
+    let t = TempFile::new();
+    write_log(&t.0, &THREE);
+    let full = fs::read(&t.0).unwrap();
+    fs::write(&t.0, &full[..full.len() - 2]).unwrap();
+    assert_eq!(
+        as_slices(&reopen(&t.0)),
+        [b"alpha".as_slice(), b""],
+        "cut inside record 3"
+    );
+    fs::write(&t.0, []).unwrap();
+    assert!(reopen(&t.0).is_empty(), "cut to 0 bytes");
+}
+
+#[test]
+fn a_flipped_bit_drops_that_record_and_every_later_one() {
+    let t = TempFile::new();
+    write_log(&t.0, &THREE);
+    let mut bytes = fs::read(&t.0).unwrap();
+    // The last byte belongs to "gamma"; the records before it stay valid.
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&t.0, &bytes).unwrap();
+    assert_eq!(as_slices(&reopen(&t.0)), [b"alpha".as_slice(), b""]);
+
+    write_log(&t.0, &THREE);
+    let mut bytes = fs::read(&t.0).unwrap();
+    bytes[10] ^= 0x80;
+    fs::write(&t.0, &bytes).unwrap();
+    assert!(
+        reopen(&t.0).is_empty(),
+        "damage in record 1 drops records 2 and 3 too"
+    );
+}
+
+/// Random records, cut or bit-flipped at a random place, then appended to.
+#[test]
+fn random_damage_then_appends_match_a_simple_model() {
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let t = TempFile::new();
+    for _ in 0..100 {
+        let _ = fs::remove_file(&t.0);
+        let records: Vec<Vec<u8>> = (0..1 + next() % 12)
+            .map(|_| (0..next() % 40).map(|_| next() as u8).collect())
+            .collect();
+        write_log(
+            &t.0,
+            &records.iter().map(|r| r.as_slice()).collect::<Vec<_>>(),
         );
-        assert_eq!(fs::read(&path).unwrap(), FILE_HEADER, "{name}");
-        assert_eq!(wal.append(b"ok").unwrap(), 0);
-    }
-}
-
-// ---- Milestone 2: append + read_all ----
-
-#[test]
-fn on_disk_format_is_little_endian_len_crc_payload() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    write_log(&path, &[b"hello".to_vec()]);
-    let bytes = fs::read(&path).unwrap();
-    assert_eq!(&bytes[..8], b"WALv0001");
-    assert_eq!(&bytes[8..12], &5u32.to_le_bytes());
-    assert_eq!(&bytes[12..16], &0x3610_a686u32.to_le_bytes()); // CRC-32 of "hello"
-    assert_eq!(&bytes[16..], b"hello");
-}
-
-#[test]
-fn append_returns_lsns_and_read_all_returns_payloads_in_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let (mut wal, _) = Wal::open(&path, opts()).unwrap();
-    assert_eq!(wal.append(b"").unwrap(), 0);
-    assert_eq!(wal.append(b"a").unwrap(), 1);
-    assert_eq!(wal.append(b"").unwrap(), 2);
-    drop(wal);
-    // An empty payload is a valid 8-byte record.
-    assert_eq!(file_len(&path), 8 + 8 + (8 + 1) + 8);
-    assert_eq!(
-        Wal::read_all(&path, MAX).unwrap(),
-        vec![b"".to_vec(), b"a".to_vec(), b"".to_vec()]
-    );
-}
-
-#[test]
-fn read_all_on_short_or_missing_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let short = dir.path().join("short");
-    fs::write(&short, b"WAL").unwrap();
-    assert_eq!(Wal::read_all(&short, MAX).unwrap(), Vec::<Vec<u8>>::new());
-    let err = Wal::read_all(&dir.path().join("nope"), MAX).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::NotFound);
-}
-
-// ---- Milestone 3: reopen and continue LSNs ----
-
-#[test]
-fn lsns_continue_after_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let payloads: Vec<Vec<u8>> = (0..100).map(payload).collect();
-    write_log(&path, &payloads);
-
-    let (mut wal, rec) = Wal::open(&path, opts()).unwrap();
-    assert_eq!(
-        rec,
-        Recovery {
-            records_recovered: 100,
-            bytes_truncated: 0
+        let mut bytes = fs::read(&t.0).unwrap();
+        let at = (next() as usize) % bytes.len();
+        if next() % 2 == 0 {
+            bytes.truncate(at);
+        } else {
+            bytes[at] ^= 1 << (next() % 8);
         }
-    );
-    assert_eq!(wal.append(b"next").unwrap(), 100);
-    drop(wal);
+        fs::write(&t.0, &bytes).unwrap();
 
-    let all = Wal::read_all(&path, MAX).unwrap();
-    assert_eq!(all.len(), 101);
-    assert_eq!(&all[..100], &payloads[..]);
-    assert_eq!(all[100], b"next");
-}
+        let recovered = reopen(&t.0);
+        assert!(recovered.len() <= records.len());
+        assert_eq!(recovered, records[..recovered.len()]);
 
-// ---- Milestone 4: truncated tail ----
-
-#[test]
-fn truncation_at_every_byte_of_the_last_record_recovers_the_prefix() {
-    let dir = tempfile::tempdir().unwrap();
-    let reference = dir.path().join("reference");
-    let payloads: Vec<Vec<u8>> = (0..10).map(|i| payload(i * 3)).collect();
-    write_log(&reference, &payloads);
-    let ends = record_ends(&payloads);
-    let last_start = ends[8];
-    let last_end = ends[9];
-    assert_eq!(file_len(&reference), last_end);
-
-    for cut in last_start..last_end {
-        let path = dir.path().join("cut");
-        fs::copy(&reference, &path).unwrap();
-        truncate(&path, cut);
-
-        let (mut wal, rec) = Wal::open(&path, opts()).unwrap();
-        assert_eq!(rec.records_recovered, 9, "cut at {cut}");
-        assert_eq!(rec.bytes_truncated, cut - last_start, "cut at {cut}");
-        assert_eq!(file_len(&path), last_start, "cut at {cut}");
-
-        // Appending after recovery continues at LSN 9 and is readable.
-        assert_eq!(wal.append(b"after-recovery").unwrap(), 9);
-        drop(wal);
-        let all = Wal::read_all(&path, MAX).unwrap();
-        assert_eq!(all.len(), 10, "cut at {cut}");
-        assert_eq!(&all[..9], &payloads[..9]);
-        assert_eq!(all[9], b"after-recovery");
-        let (_, rec) = Wal::open(&path, opts()).unwrap();
-        assert_eq!(rec.bytes_truncated, 0, "cut at {cut}");
+        write_log(&t.0, &[b"after"]);
+        let mut expected = recovered;
+        expected.push(b"after".to_vec());
+        assert_eq!(reopen(&t.0), expected);
     }
 }
 
+/// Hard rule: cut the file at every length and flip every bit. Each time, `open` must return an
+/// exact prefix of the appended records, and a later append must work.
+/// Covers every cut length and every bit of the file (about 90 cuts and 700 flips). A correct
+/// solution runs it in about 1.5 s in a debug build.
 #[test]
-fn read_all_stops_at_damage_and_leaves_the_file_alone() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let payloads: Vec<Vec<u8>> = (0..10).map(payload).collect();
-    write_log(&path, &payloads);
-    let ends = record_ends(&payloads);
-    truncate(&path, ends[9] - 2);
-    let before = fs::read(&path).unwrap();
-    let all = Wal::read_all(&path, MAX).unwrap();
-    assert_eq!(all, payloads[..9].to_vec());
-    assert_eq!(fs::read(&path).unwrap(), before);
-}
+fn any_cut_or_single_bit_flip_leaves_an_exact_prefix() {
+    let records: [&[u8]; 5] = [b"alpha", b"", b"gamma", &[7; 20], b"epsilon"];
+    let t = TempFile::new();
+    write_log(&t.0, &records);
+    let full = fs::read(&t.0).unwrap();
 
-// ---- Milestone 5: corruption ----
-
-#[test]
-fn payload_bit_flip_discards_the_record_and_everything_after_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let payloads: Vec<Vec<u8>> = (0..10).map(payload).collect();
-    write_log(&path, &payloads);
-    let ends = record_ends(&payloads);
-    let total = file_len(&path);
-    // Record 5 is damaged; records 6..9 stay intact but must be dropped too.
-    flip_bit(&path, ends[4] + RECORD_HEADER_LEN, 3);
-
-    let (mut wal, rec) = Wal::open(&path, opts()).unwrap();
-    assert_eq!(rec.records_recovered, 5);
-    assert_eq!(rec.bytes_truncated, total - ends[4]);
-    assert_eq!(file_len(&path), ends[4]);
-    assert_eq!(wal.append(b"x").unwrap(), 5);
-    drop(wal);
-    let all = Wal::read_all(&path, MAX).unwrap();
-    assert_eq!(all.len(), 6);
-    assert_eq!(&all[..5], &payloads[..5]);
-}
-
-#[test]
-fn length_field_larger_than_the_file_truncates_there() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let payloads: Vec<Vec<u8>> = (0..20).map(payload).collect();
-    write_log(&path, &payloads);
-    let ends = record_ends(&payloads);
-    let total = file_len(&path);
-
-    // Setting bit 31 of record 7's length makes it ~2 GiB. The limit is raised
-    // so the file-size check, not max_record_len, is what rejects it.
-    let big = WalOptions {
-        sync_each_append: false,
-        max_record_len: u32::MAX,
-    };
-    flip_bit(&path, ends[6] + 3, 7);
-    let (_, rec) = Wal::open(&path, big).unwrap();
-    assert_eq!(rec.records_recovered, 7);
-    assert_eq!(rec.bytes_truncated, total - ends[6]);
-    assert_eq!(file_len(&path), ends[6]);
-}
-
-// ---- Milestone 6: sync counting and size limit ----
-
-#[test]
-fn sync_each_append_counts_one_sync_per_append() {
-    let dir = tempfile::tempdir().unwrap();
-    let o = WalOptions {
-        sync_each_append: true,
-        max_record_len: MAX,
-    };
-    let (mut wal, _) = Wal::open(&dir.path().join("log"), o).unwrap();
-    assert_eq!(wal.sync_count(), 0, "open must not count");
-    for i in 0..25 {
-        wal.append(b"x").unwrap();
-        assert_eq!(wal.sync_count(), i + 1);
+    let mut damaged: Vec<(String, Vec<u8>)> = Vec::new();
+    for len in 0..=full.len() {
+        damaged.push((format!("cut to {len}"), full[..len].to_vec()));
     }
-}
-
-#[test]
-fn without_sync_each_append_only_explicit_sync_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut wal, _) = Wal::open(&dir.path().join("log"), opts()).unwrap();
-    for _ in 0..50 {
-        wal.append(b"x").unwrap();
+    for byte in 0..full.len() {
+        for bit in 0..8 {
+            let mut f = full.clone();
+            f[byte] ^= 1 << bit;
+            damaged.push((format!("flip bit {bit} of byte {byte}"), f));
+        }
     }
-    assert_eq!(wal.sync_count(), 0);
-    wal.sync().unwrap();
-    wal.sync().unwrap();
-    assert_eq!(wal.sync_count(), 2);
-}
 
-#[test]
-fn max_record_len_is_enforced_on_append() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let o = WalOptions {
-        sync_each_append: true,
-        max_record_len: 16,
-    };
-    let (mut wal, _) = Wal::open(&path, o).unwrap();
-    assert_eq!(wal.append(&[7u8; 16]).unwrap(), 0);
-    let len_before = file_len(&path);
-    let err = wal.append(&[7u8; 17]).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    assert_eq!(file_len(&path), len_before);
-    // The rejected append consumed no LSN and no sync.
-    assert_eq!(wal.sync_count(), 1);
-    assert_eq!(wal.append(b"next").unwrap(), 1);
-}
+    for (what, bytes) in damaged {
+        fs::write(&t.0, &bytes).unwrap();
+        let recovered = reopen(&t.0);
+        assert!(recovered.len() <= records.len(), "{what}: extra records");
+        assert_eq!(
+            as_slices(&recovered),
+            records[..recovered.len()],
+            "{what}: not a prefix"
+        );
 
-#[test]
-fn record_longer_than_max_record_len_is_invalid_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("log");
-    let payloads = vec![vec![1u8; 10], vec![2u8; 100], vec![3u8; 10]];
-    write_log(&path, &payloads);
-    let ends = record_ends(&payloads);
-    let small = WalOptions {
-        sync_each_append: false,
-        max_record_len: 50,
-    };
-    let (_, rec) = Wal::open(&path, small).unwrap();
-    assert_eq!(rec.records_recovered, 1);
-    assert_eq!(rec.bytes_truncated, ends[2] - ends[0]);
+        write_log(&t.0, &[b"new"]);
+        let again = reopen(&t.0);
+        assert_eq!(again.len(), recovered.len() + 1, "{what}: after append");
+        assert_eq!(again[..recovered.len()], recovered[..], "{what}");
+        assert_eq!(again.last().unwrap(), b"new", "{what}");
+    }
 }
