@@ -5,21 +5,10 @@ use std::hash::Hash;
 
 use crate::bucket::{ConfigError, TokenBucket};
 
-/// Outcome of [`KeyedLimiter::check`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Decision {
-    /// One token was taken.
-    Allowed,
-    /// The key's bucket is empty.
-    Limited,
-    /// The table is full and the key is not in it. Callers treat this as allowed.
-    Untracked,
-}
-
 /// One [`TokenBucket`] per key, with at most `max_keys` keys in memory.
 ///
-/// A key that is not in the table while the table holds `max_keys` entries gets
-/// `Untracked`, is not stored, and increments `untracked_count()`. Keys are never evicted.
+/// A key that is not in the table while the table holds `max_keys` entries is
+/// allowed and is not stored. Keys are never evicted.
 #[derive(Debug)]
 pub struct KeyedLimiter<K: Hash + Eq + Clone> {
     #[allow(dead_code)]
@@ -34,9 +23,10 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
         todo!()
     }
 
-    /// Takes one token from `key`'s bucket. A new key starts with a full bucket, and
-    /// this call takes its first token.
-    pub fn check(&mut self, key: &K, now_ns: u64) -> Decision {
+    /// Takes one token from `key`'s bucket and returns whether it succeeded.
+    /// A new key starts with a full bucket, and this call takes its first token.
+    /// A new key that does not fit in the table returns `true` and stores nothing.
+    pub fn check(&mut self, key: &K, now_ns: u64) -> bool {
         let _ = (key, now_ns);
         todo!()
     }
@@ -48,10 +38,5 @@ impl<K: Hash + Eq + Clone> KeyedLimiter<K> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Number of `Untracked` decisions so far.
-    pub fn untracked_count(&self) -> u64 {
-        todo!()
     }
 }

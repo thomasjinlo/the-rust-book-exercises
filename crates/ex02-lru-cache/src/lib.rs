@@ -111,18 +111,13 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     }
 
     /// Number of slab slots currently allocated, live or vacant.
-    /// Must never exceed `capacity()`. `clear` resets it to 0.
+    /// Must never exceed `capacity()`.
     pub fn slab_len(&self) -> usize {
         todo!()
     }
 
     /// Iterates entries from most to least recently used. Does not change recency.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        todo!()
-    }
-
-    /// Removes all entries, dropping every value exactly once. Capacity is unchanged.
-    pub fn clear(&mut self) {
         todo!()
     }
 }

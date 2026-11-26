@@ -6,4 +6,4 @@ mod keyed;
 
 pub use bucket::{ConfigError, TokenBucket};
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use keyed::{Decision, KeyedLimiter};
+pub use keyed::KeyedLimiter;

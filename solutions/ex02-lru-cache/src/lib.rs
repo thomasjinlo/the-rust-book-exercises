@@ -143,7 +143,7 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
     }
 
     /// Number of slab slots currently allocated, live or vacant.
-    /// Must never exceed `capacity()`. `clear` resets it to 0.
+    /// Must never exceed `capacity()`.
     pub fn slab_len(&self) -> usize {
         self.slots.len()
     }
@@ -154,15 +154,6 @@ impl<K: Hash + Eq + Clone, V> LruCache<K, V> {
             cache: self,
             next: self.head,
         }
-    }
-
-    /// Removes all entries, dropping every value exactly once. Capacity is unchanged.
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.slots.clear();
-        self.head = NIL;
-        self.tail = NIL;
-        self.free = NIL;
     }
 
     fn node(&self, idx: usize) -> &Node<K, V> {
